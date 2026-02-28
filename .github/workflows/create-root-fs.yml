@@ -1,0 +1,186 @@
+- name: Configuration
+  run: |
+
+    set -euo pipefail
+
+	  KIOSK_USER="kiosk"
+	  OUTPUT_TARBALL="arch_kiosk_rootfs.tar.zst"
+	  ROOTFS_DIR="$(pwd)/arch_rootfs"
+
+	  log()  { echo "[+] $*"; }
+	  die()  { echo "[-] $*" >&2; exit 1; }
+	  
+	  
+- name: Update and install required packages
+  run: |
+	  export DEBIAN_FRONTEND=noninteractive
+	  apt-get update -qq
+	  apt-get install -y --no-install-recommends \
+	      ca-certificates curl gnupg lsb-release \
+	      zstd proot
+
+	  if ! command -v docker &>/dev/null; then
+	      log "Installing Docker..."
+	      install -m 0755 -d /etc/apt/keyrings
+	      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+		  | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+	      chmod a+r /etc/apt/keyrings/docker.gpg
+	      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+	  https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+		  > /etc/apt/sources.list.d/docker.list
+	      apt-get update -qq
+	      apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
+	  fi
+
+	  if ! docker info &>/dev/null; then
+	      log "Starting Docker daemon..."
+	      service docker start || dockerd &>/tmp/dockerd.log &
+	      sleep 5
+	      docker info &>/dev/null || die "Docker daemon failed to start. Check /tmp/dockerd.log"
+	  fi
+
+
+- name: Create Arch root filesystem
+  run: |
+	  docker pull --quiet archlinux:latest
+	  CONTAINER_ID=$(docker create archlinux:latest)
+	  rm -rf "$ROOTFS_DIR"
+	  mkdir -p "$ROOTFS_DIR"
+	  docker export "$CONTAINER_ID" | tar -x -C "$ROOTFS_DIR"
+	  docker rm "$CONTAINER_ID"
+
+	  arch_run() {
+	      if [ "$(id -u)" -eq 0 ]; then
+		  for fs in proc sys dev dev/pts; do
+		      mountpoint -q "$ROOTFS_DIR/$fs" 2>/dev/null || \
+		          mount --bind "/$fs" "$ROOTFS_DIR/$fs"
+		  done
+		  chroot "$ROOTFS_DIR" /bin/bash -c "$*"
+	      else
+		  proot -0 -r "$ROOTFS_DIR" \
+		      -b /proc -b /sys -b /dev \
+		      /bin/bash -c "$*"
+	      fi
+	  }
+
+	  cleanup_mounts() {
+	      for fs in dev/pts dev sys proc; do
+		  mountpoint -q "$ROOTFS_DIR/$fs" 2>/dev/null && \
+		      umount -l "$ROOTFS_DIR/$fs" || true
+	      done
+	  }
+	  trap cleanup_mounts EXIT
+
+	  cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
+
+	  arch_run "
+	      pacman-key --init
+	      pacman-key --populate archlinux
+	      # Refresh mirrorlist with a working server (CDN)
+	      echo 'Server = https://geo.mirror.pkgbuild.com/\$repo/os/\$arch' \
+		  > /etc/pacman.d/mirrorlist
+	      pacman -Sy --noconfirm archlinux-keyring
+	      pacman -Su --noconfirm
+	  "
+	  
+	
+- name: Create autologin user
+  run: |
+	  arch_run "
+	      useradd -m -s /bin/bash '$KIOSK_USER' 2>/dev/null || true
+	      passwd -d '$KIOSK_USER'   # passwordless login
+
+	      # systemd getty autologin override
+	      mkdir -p /etc/systemd/system/getty@tty1.service.d
+	      cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'UNIT'
+	  [Service]
+	  ExecStart=
+	  ExecStart=-/sbin/agetty --autologin $KIOSK_USER --noclear %I \$TERM
+	  UNIT
+	      systemctl enable getty@tty1.service 2>/dev/null || true
+	  "
+
+- name: Install Chromium
+	run: |
+	  arch_run "
+	      pacman -S --noconfirm --needed \
+		  chromium \
+		  xorg-server \
+		  xorg-xinit \
+		  xf86-video-vesa \
+		  ttf-liberation \
+		  noto-fonts \
+		  iputils
+	  "
+
+- name: Create startup scripts
+  run: |
+	  cat > "$ROOTFS_DIR/home/$KIOSK_USER/.xinitrc" <<'XINITRC'
+	  #!/bin/bash
+	  URL_FILE="$HOME/url.txt"
+	  URL="about:blank"
+	  [ -r "$URL_FILE" ] && URL="$(cat "$URL_FILE")"
+
+	  # Disable screen saver / DPMS
+	  xset s off
+	  xset s noblank
+	  xset -dpms
+
+	  exec chromium \
+	      --no-sandbox \
+	      --kiosk \
+	      --noerrdialogs \
+	      --disable-infobars \
+	      --disable-session-crashed-bubble \
+	      --disable-restore-session-state \
+	      --disable-background-networking \
+	      --disable-translate \
+	      --no-first-run \
+	      "$URL"
+	  XINITRC
+	  chmod +x "$ROOTFS_DIR/home/$KIOSK_USER/.xinitrc"
+
+	  cat > "$ROOTFS_DIR/home/$KIOSK_USER/.bash_profile" <<'BASHPROFILE'
+	  #!/bin/bash
+
+	  [ "$(tty)" = "/dev/tty1" ] || return
+
+	  echo "[kiosk] Checking internet connectivity..."
+	  if ! ping -c 3 -W 5 8.8.8.8 &>/dev/null; then
+	      echo "[kiosk] No internet access – shutting down."
+	      sudo /sbin/poweroff
+	      exit 1
+	  fi
+
+	  echo "[kiosk] Internet OK – starting Chromium kiosk..."
+	  exec startx -- -nolisten tcp &>/tmp/kiosk_x.log
+	  BASHPROFILE
+
+	  cat > "$ROOTFS_DIR/etc/sudoers.d/kiosk-poweroff" <<'SUDOERS'
+	  kiosk ALL=(ALL) NOPASSWD: /sbin/poweroff, /sbin/shutdown
+	  SUDOERS
+	  chmod 0440 "$ROOTFS_DIR/etc/sudoers.d/kiosk-poweroff"
+
+	  arch_run "chown -R '$KIOSK_USER:$KIOSK_USER' '/home/$KIOSK_USER'"
+
+	  echo "https://example.com" > "$ROOTFS_DIR/home/$KIOSK_USER/url.txt"
+	  arch_run "chown '$KIOSK_USER:$KIOSK_USER' '/home/$KIOSK_USER/url.txt'"
+
+- name: Create tarball
+	run: |
+	  cleanup_mounts   # unmount before archiving
+
+	  tar -C "$ROOTFS_DIR" \
+	      --use-compress-program="zstd -T0 -19" \
+	      -cpf "$OUTPUT_TARBALL" \
+	      .
+
+	  FINAL_SIZE=$(du -sh "$OUTPUT_TARBALL" | cut -f1)
+
+- name: Upload rootfs tarball
+  uses: actions/upload-artifact@v4
+  with:
+    name: arch-kiosk-rootfs
+    path: arch_kiosk_rootfs.tar.zst
+    retention-days: 7
+    compression-level: 0
